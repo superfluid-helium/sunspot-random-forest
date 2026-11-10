@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+"""
+Download the sunspot number datasets (V2.0) from SILSO
+(Royal Observatory of Belgium, https://www.sidc.be/SILSO/).
+
+Usage:
+    python download_silso.py                  # download everything to ./silso_data
+    python download_silso.py -o my_folder     # choose output folder
+    python download_silso.py -d daily monthly # download only some datasets
+    python download_silso.py --parse          # also print a pandas summary
+
+Files are semicolon-separated CSVs. A header row with column names is added to
+each saved file (use --no-header to keep the raw download). Missing values are -1.
+"""
+
+import argparse
+import ssl
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+BASE_URL = "https://www.sidc.be/SILSO/DATA/"
+
+# name -> (filename, column names)
+DATASETS = {
+    "daily": (
+        "SN_d_tot_V2.0.csv",
+        ["year", "month", "day", "decimal_year", "sunspot_number",
+         "std_dev", "n_observations", "definitive"],
+    ),
+    "monthly": (
+        "SN_m_tot_V2.0.csv",
+        ["year", "month", "decimal_year", "sunspot_number",
+         "std_dev", "n_observations", "definitive"],
+    ),
+    "monthly_smoothed": (
+        "SN_ms_tot_V2.0.csv",
+        ["year", "month", "decimal_year", "smoothed_sunspot_number",
+         "std_dev", "n_observations", "definitive"],
+    ),
+    "yearly": (
+        "SN_y_tot_V2.0.csv",
+        ["decimal_year", "sunspot_number", "std_dev",
+         "n_observations", "definitive"],
+    ),
+    # Hemispheric files have ONE observation-count column (for the total),
+    # not one per hemisphere.
+    "daily_hemispheric": (
+        "SN_d_hem_V2.0.csv",
+        ["year", "month", "day", "decimal_year", "total", "north", "south",
+         "std_total", "std_north", "std_south", "n_observations", "definitive"],
+    ),
+    "monthly_hemispheric": (
+        "SN_m_hem_V2.0.csv",
+        ["year", "month", "decimal_year", "total", "north", "south",
+         "std_total", "std_north", "std_south", "n_observations", "definitive"],
+    ),
+    "monthly_smoothed_hemispheric": (
+        "SN_ms_hem_V2.0.csv",
+        ["year", "month", "decimal_year", "total", "north", "south",
+         "std_total", "std_north", "std_south", "n_observations", "definitive"],
+    ),
+    "yearly_hemispheric": (
+        "SN_y_hem_V2.0.csv",
+        ["decimal_year", "total", "north", "south",
+         "std_total", "std_north", "std_south", "n_observations", "definitive"],
+    ),
+}
+
+
+def make_ssl_context(insecure: bool = False) -> ssl.SSLContext:
+    """Build an SSL context.
+
+    Prefers the certifi CA bundle if installed (fixes the common macOS
+    "CERTIFICATE_VERIFY_FAILED" error with python.org builds of Python).
+    insecure=True disables verification entirely - use only as a last resort.
+    """
+    if insecure:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        return ssl.create_default_context()
+
+
+def download(url: str, dest: Path, ctx: ssl.SSLContext, retries: int = 3) -> None:
+    """Download url to dest, retrying on transient errors."""
+    # SILSO may reject the default urllib user agent, so set our own.
+    req = urllib.request.Request(
+        url, headers={"User-Agent": "Mozilla/5.0 (silso-downloader)"}
+    )
+    for attempt in range(1, retries + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=60, context=ctx) as resp:
+                data = resp.read()
+            dest.write_bytes(data)
+            return
+        except (urllib.error.URLError, TimeoutError) as exc:
+            if "CERTIFICATE_VERIFY_FAILED" in str(exc):
+                print("  SSL certificate error. Fix: run 'pip install certifi' (or, on macOS, "
+                      "run 'Install Certificates.command' in your Python folder), "
+                      "or re-run with --insecure.", file=sys.stderr)
+                raise
+            print(f"  attempt {attempt}/{retries} failed: {exc}", file=sys.stderr)
+            if attempt == retries:
+                raise
+            time.sleep(2 * attempt)
+
+
+def add_header(path: Path, columns: list) -> bool:
+    """Rewrite the downloaded file in place with a header row.
+
+    Fields are stripped of padding spaces. If the file's column count does not
+    match the names defined here, the file is left untouched and False is returned.
+    """
+    lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    rows = [[f.strip() for f in ln.split(";")] for ln in lines]
+    if not rows:
+        return False
+    if len(rows[0]) != len(columns):
+        print(f"  WARNING: file has {len(rows[0])} columns but {len(columns)} names "
+              "are defined; header NOT added", file=sys.stderr)
+        return False
+    out = [";".join(columns)] + [";".join(r) for r in rows]
+    path.write_text("\n".join(out) + "\n", encoding="utf-8")
+    return True
+
+
+def parse_summary(path: Path) -> None:
+    """Optional: load with pandas and print a short summary."""
+    try:
+        import pandas as pd
+    except ImportError:
+        print("  (pandas not installed; skipping parse)")
+        return
+    df = pd.read_csv(path, sep=";", skipinitialspace=True)
+    print(f"  {len(df)} rows x {df.shape[1]} columns")
+    print(df.head(3).to_string(index=False))
+    print("  ...")
+    print(df.tail(3).to_string(index=False))
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Download SILSO sunspot number data.")
+    parser.add_argument("-o", "--outdir", default="silso_data",
+                        help="output directory (default: silso_data)")
+    parser.add_argument("-d", "--datasets", nargs="+", choices=list(DATASETS),
+                        default=list(DATASETS),
+                        help="which datasets to download (default: all)")
+    parser.add_argument("--insecure", action="store_true",
+                        help="skip SSL certificate verification (last resort)")
+    parser.add_argument("--no-header", action="store_true",
+                        help="keep files exactly as downloaded (no header row added)")
+    parser.add_argument("--parse", action="store_true",
+                        help="parse each file with pandas and print a summary")
+    args = parser.parse_args()
+
+    ctx = make_ssl_context(args.insecure)
+    if args.insecure:
+        print("WARNING: SSL verification disabled.", file=sys.stderr)
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    failures = 0
+    for name in args.datasets:
+        filename, columns = DATASETS[name]
+        url = BASE_URL + filename
+        dest = outdir / filename
+        print(f"Downloading {name}: {url}")
+        try:
+            download(url, dest, ctx)
+            print(f"  saved to {dest} ({dest.stat().st_size / 1024:.1f} KiB)")
+            if not args.no_header and add_header(dest, columns):
+                print("  header row added")
+            if args.parse:
+                parse_summary(dest)
+        except Exception as exc:  # noqa: BLE001
+            failures += 1
+            print(f"  FAILED: {exc}", file=sys.stderr)
+
+    print(f"\nDone. {len(args.datasets) - failures}/{len(args.datasets)} succeeded.")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
